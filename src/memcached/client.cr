@@ -16,12 +16,21 @@
 # client.delete("key")
 # ```
 module Memcached
+  @servers : Server
+  @hash_function : String -> Int32
+
   class Client
     def initialize(servers : Array(Tuple(String, Int32)) = [{"localhost", 11211}])
       @servers = Array(Memcached::Server).new
       servers.each do |server|
         @servers.push(Memcached::Server.new(server[0], server[1]))
       end
+      @hash_function = ->(key : String) { key.hash % @servers.size }
+    end
+
+    def initialize(servers : Array(Memcached::Server), hash_function : (String -> Int32))
+      @servers = servers
+      @hash_function = hash_function
     end
 
     # Set key - value pair in memcached.
@@ -52,7 +61,23 @@ module Memcached
     # value for this key will be nil in the returned hash
     def get_multi(keys : Array(String)) : Hash(String, String | Nil)
       result = Hash(String, String | Nil).new
-      # TODO
+      keys_by_server = Hash(Memcached::Server, Array(String)).new
+      keys.each do |key|
+        server = get_server_for_key(key)
+        if !keys_by_server[server]
+          keys_by_server[server] = Array(String).new
+        end
+        keys_by_server[server].push(key)
+      end
+      channel = Channel(Hash(String, String | Nil)).new
+      keys_by_server.each do |server, keys|
+        spawn do
+          channel.send(server.get_multi(keys))
+        end
+      end
+      keys_by_server.keys.size.times do
+        result.merge!(channel.receive)
+      end
       result
     end
 
@@ -92,8 +117,17 @@ module Memcached
     #
     # Passing delay parameter postpone the removal.
     def flush(delay = 0_u32) : Bool
-      # TODO
-      return false
+      channel = Channel(Bool).new
+      @servers.each do |server|
+        spawn do
+          channel.send(server.flush(delay))
+        end
+      end
+      result = true
+      @servers.size.times do
+        result = result && channel.receive
+      end
+      return result
     end
 
     # Increment key value by delta.
@@ -129,7 +163,7 @@ module Memcached
     end
 
     private def get_server_for_key(key : String) : Memcached::Server
-      server_number = key.hash % @servers.size
+      server_number = @hash_function.call(key)
       @servers[server_number]
     end
   end
